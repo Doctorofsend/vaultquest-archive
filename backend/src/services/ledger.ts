@@ -1,7 +1,7 @@
 import { Prisma } from "@prisma/client";
 import type { PrismaClient } from "@prisma/client";
 import { randomUUID } from "node:crypto";
-import { ERROR_CODES, FINALITY_POLICY } from "../constants.js";
+import { ERROR_CODES, FINALITY_POLICY, canTransition, type ActionStatus } from "../constants.js";
 import { AppError } from "../errors.js";
 import { withTelemetry } from "./telemetry.js";
 import type { IntentInput, ActionRecord } from "../types.js";
@@ -286,20 +286,20 @@ export class LedgerService {
     const expiresAt = new Date(Date.now() + (ttlMs ?? this.defaultLeaseTtlMs));
     try {
       await this.prisma.actionLease.create({
-        data: { actionId: input.actionId, workerId: input.workerId, expiresAt }
+        data: { actionId, workerId, expiresAt }
       });
       return true;
     } catch (err) {
       if (err instanceof Prisma.PrismaClientKnownRequestError && err.code === "P2002") {
-        const owned = await this.prisma.actionLease.findUnique({ where: { actionId: input.actionId } });
+        const owned = await this.prisma.actionLease.findUnique({ where: { actionId } });
         if (!owned || owned.expiresAt.getTime() <= Date.now()) {
           const replaced = await this.prisma.actionLease.updateMany({
-            where: { actionId: input.actionId, expiresAt: { lte: new Date() } },
-            data: { workerId: input.workerId, acquiredAt: new Date(), expiresAt }
+            where: { actionId, expiresAt: { lte: new Date() } },
+            data: { workerId, acquiredAt: new Date(), expiresAt }
           });
           return replaced.count > 0;
         }
-        return owned.workerId === input.workerId;
+        return owned.workerId === workerId;
       }
       throw err;
     }
@@ -633,6 +633,7 @@ export class LedgerService {
 
     const where = {
       walletAddress,
+      redactedAt: null,
       ...(status !== undefined && { status }),
       ...(type !== undefined && { actionType: type as ActionStatus })
     };
@@ -682,6 +683,7 @@ export class LedgerService {
             checkpointed_at: (input.ledgerClosedAt ?? new Date()).toISOString()
           },
           sorobanEventId: input.sorobanEventId,
+          verifiedPayload: (input.eventPayload ?? undefined) as Prisma.InputJsonValue,
           confirmedAt: new Date(),
           errorCode: input.statusHint === "reverted" ? ERROR_CODES.REVERTED_ON_CHAIN : null,
           observedLedger: ledger ?? row.observedLedger,
@@ -1348,18 +1350,37 @@ export class LedgerService {
   /**
    * List submitted actions that are eligible for recovery work (no active lease).
    */
-  async listRecoverableActions(limit = 25, offset = 0) {
-    const candidates = await this.prisma.actionLedger.findMany({
+  /**
+   * #778: cursor-based listing of recoverable (submitted, no active lease)
+   * actions.  Ordering on (submittedAt, id) is stable: newly-submitted rows
+   * always appear *after* the current page, so callers never skip or see
+   * duplicate records even when rows are inserted or transition status while
+   * paginating.
+   *
+   * @param limit   - max records per page (default 25)
+   * @param cursor  - id of the last record seen on the previous page
+   */
+  async listRecoverableActions(
+    limit = 25,
+    cursor?: string | null,
+  ): Promise<{ items: Awaited<ReturnType<typeof this["prisma"]["actionLedger"]["findMany"]>>; nextCursor: string | null }> {
+    const rows = await this.prisma.actionLedger.findMany({
       where: { status: "submitted" },
-      orderBy: { submittedAt: "asc" },
-      take: limit,
-      skip: offset
+      orderBy: [{ submittedAt: "asc" }, { id: "asc" }],
+      take: limit + 1,
+      ...(cursor != null ? { cursor: { id: cursor }, skip: 1 } : {}),
     });
 
+    const hasMore = rows.length > limit;
+    const items = hasMore ? rows.slice(0, limit) : rows;
+
     const leases = await this.prisma.actionLease.findMany({
-      where: { actionId: { in: candidates.map((c) => c.id) } }
+      where: { actionId: { in: items.map((c) => c.id) } },
     });
     const leased = new Set(leases.map((l) => l.actionId));
-    return candidates.filter((c) => !leased.has(c.id));
+    const filtered = items.filter((c) => !leased.has(c.id));
+
+    const nextCursor = hasMore ? (items[items.length - 1]?.id ?? null) : null;
+    return { items: filtered, nextCursor };
   }
 }

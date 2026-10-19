@@ -25,11 +25,17 @@ export const PERMISSIONS = [
   // #815: operation-limit policies, overrides and resets.
   "admin.limits.read",
   "admin.limits.write",
+  // Guarded feature-flag rollouts and rollback verification.
+  "admin.flags.read",
+  "admin.flags.write",
   "admin.audit.read",
   "admin.audit.write",
   "admin.audit.export",
   "admin.ledger.verify",
   "admin.export.any",
+  // #791: scoped maintainer impersonation.
+  "admin.impersonation.read",
+  "admin.impersonation.write",
   "internal.reconcile",
   "internal.checkpoint",
   "internal.trace",
@@ -68,6 +74,11 @@ export const ROLE_PERMISSIONS: Readonly<Record<Role, readonly Permission[]>> = {
     "admin.audit_trail.export",
     "admin.limits.read",
     "admin.limits.write",
+    "admin.flags.read",
+    "admin.flags.write",
+    // #791: impersonation — maintainer-only.
+    "admin.impersonation.read",
+    "admin.impersonation.write",
   ],
   service: [
     "internal.reconcile",
